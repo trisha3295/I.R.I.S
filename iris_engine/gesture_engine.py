@@ -2,64 +2,61 @@ import numpy as np
 import time
 from typing import Tuple, Optional, Dict, Any, List
 
+
 class GestureEngine:
     """
-    Advanced Adaptive Gesture & Facial Telemetry Engine.
-    
-    Features:
-    - Dynamic Relative Asymmetry Wink Detection (immune to natural squints & eye shapes)
-    - Dynamic Baseline Auto-Calibration (tracks resting eye open state)
-    - Dual-Eye Blink Hold (0.35s for Left Click, 0.75s for Drag & Drop toggle)
-    - Mouth Aspect Ratio (MAR) & Eyebrow Telemetry for Smart Scrolling
-    - Deadzone gating and anti-jitter cursor suppression
+    Calibrated Adaptive Gesture & Facial Telemetry Engine for I.R.I.S.
+
+    Gesture Map:
+      - Left Wink  (0.12s)       -> Left Click
+      - Right Wink (0.12s)       -> Right Click
+      - Long Dual Blink (0.35s)  -> Double Click
+      - Mouth Open + Head Up     -> Scroll Up
+      - Mouth Open + Head Down   -> Scroll Down
     """
+
     def __init__(
         self,
-        ear_threshold_ratio: float = 0.65,      # Closed eye must drop to 65% of baseline
-        asymmetry_threshold: float = 0.30,      # Relative difference |L - R| / max(L, R)
-        wink_hold_time: float = 0.18,           # Snappy response for winks
-        blink_hold_time: float = 0.35,          # Hold time for dual-eye click
-        drag_hold_time: float = 0.75,           # Long hold time for Drag & Drop toggle
-        click_cooldown: float = 0.60,           # Cooldown between successive clicks
-        deadzone_x: float = 14.0,
-        deadzone_y: float = 8.0
+        wink_hold_time: float = 0.12,
+        double_click_hold_time: float = 0.35,
+        click_cooldown: float = 0.40,
+        scroll_pitch_deadzone: float = 6.0,
+        scroll_hold_time: float = 0.0,
+        **kwargs
     ):
-        self.ear_threshold_ratio = ear_threshold_ratio
-        self.asymmetry_threshold = asymmetry_threshold
         self.wink_hold_time = wink_hold_time
-        self.blink_hold_time = blink_hold_time
-        self.drag_hold_time = drag_hold_time
+        self.double_click_hold_time = double_click_hold_time
         self.click_cooldown = click_cooldown
-        self.deadzone_x = deadzone_x
-        self.deadzone_y = deadzone_y
+        self.scroll_pitch_deadzone = scroll_pitch_deadzone
+        self.scroll_hold_time = scroll_hold_time
 
-        # Canonical FaceMesh landmark indices
-        # In mirrored frame, Eye A is on screen left (user's right), Eye B is on screen right (user's left)
-        self.EYE_RIGHT_ANATOMIC = [33, 160, 158, 133, 153, 144]   # Left side in unmirrored, Right in mirrored
-        self.EYE_LEFT_ANATOMIC = [362, 385, 387, 263, 373, 380]  # Right side in unmirrored, Left in mirrored
-        self.MOUTH_INDICES = [13, 14, 78, 308]                     # Upper lip, lower lip, left corner, right corner
+        # FaceMesh landmark indices
+        self.EYE_RIGHT_ANATOMIC = [33, 160, 158, 133, 153, 144]
+        self.EYE_LEFT_ANATOMIC  = [362, 385, 387, 263, 373, 380]
+        self.MOUTH_INDICES      = [13, 14, 78, 308]
 
         # Adaptive baselines
-        self.baseline_l_ear = 0.28
-        self.baseline_r_ear = 0.28
-        self.baseline_mar = 0.15
+        self.baseline_l_ear = 0.18
+        self.baseline_r_ear = 0.18
+        self.baseline_mar   = 0.015
+        self.calibration_samples: List[Tuple[float, float, float]] = []
         self.is_calibrated = False
 
         # State tracking
-        self.last_click_time = 0.0
+        self.last_click_time: float = 0.0
         self.blink_start_time: Optional[float] = None
         self.left_wink_start_time: Optional[float] = None
         self.right_wink_start_time: Optional[float] = None
-        
+
         self.is_blinking = False
         self.is_left_winking = False
         self.is_right_winking = False
-        self.is_dragging = False
         self.mouth_opened = False
+        self.mouth_open_start_time: Optional[float] = None
 
     @staticmethod
     def calculate_ear(eye_indices: list, landmarks: np.ndarray) -> float:
-        """Calculates 6-point Eye Aspect Ratio (EAR)."""
+        """6-point Eye Aspect Ratio."""
         pts = [landmarks[idx][:2] for idx in eye_indices]
         v1 = np.linalg.norm(pts[1] - pts[5])
         v2 = np.linalg.norm(pts[2] - pts[4])
@@ -68,51 +65,48 @@ class GestureEngine:
 
     @staticmethod
     def calculate_mar(mouth_indices: list, landmarks: np.ndarray) -> float:
-        """Calculates Mouth Aspect Ratio (MAR) for open-mouth gestures."""
+        """Mouth Aspect Ratio."""
         p_upper = landmarks[mouth_indices[0]][:2]
         p_lower = landmarks[mouth_indices[1]][:2]
-        p_left = landmarks[mouth_indices[2]][:2]
+        p_left  = landmarks[mouth_indices[2]][:2]
         p_right = landmarks[mouth_indices[3]][:2]
-        
-        vert_dist = np.linalg.norm(p_upper - p_lower)
-        horiz_dist = np.linalg.norm(p_left - p_right)
-        return float(vert_dist / horiz_dist) if horiz_dist > 1e-6 else 0.0
+        vert = np.linalg.norm(p_upper - p_lower)
+        horiz = np.linalg.norm(p_left - p_right)
+        return float(vert / horiz) if horiz > 1e-6 else 0.0
 
     def update_baseline(self, l_ear: float, r_ear: float, mar: float) -> None:
-        """Slow exponential moving average to adapt to lighting/posture changes."""
-        if not self.is_blinking and not self.is_left_winking and not self.is_right_winking:
-            if l_ear > 0.20 and r_ear > 0.20:
-                self.baseline_l_ear = 0.98 * self.baseline_l_ear + 0.02 * l_ear
-                self.baseline_r_ear = 0.98 * self.baseline_r_ear + 0.02 * r_ear
-            if mar < 0.35:
-                self.baseline_mar = 0.98 * self.baseline_mar + 0.02 * mar
+        """Initial 15-frame rapid calibration, followed by gentle running EMA."""
+        if len(self.calibration_samples) < 15:
+            self.calibration_samples.append((l_ear, r_ear, mar))
+            if len(self.calibration_samples) >= 15:
+                self.baseline_l_ear = float(np.mean([s[0] for s in self.calibration_samples]))
+                self.baseline_r_ear = float(np.mean([s[1] for s in self.calibration_samples]))
+                self.baseline_mar   = float(np.mean([s[2] for s in self.calibration_samples]))
+                self.is_calibrated = True
+            return
 
-    def set_calibration(self, l_ear: float, r_ear: float, mar: float) -> None:
-        """Sets explicit calibrated baseline values."""
-        self.baseline_l_ear = max(0.20, l_ear)
-        self.baseline_r_ear = max(0.20, r_ear)
-        self.baseline_mar = max(0.10, mar)
-        self.is_calibrated = True
+        if not self.is_blinking and not self.is_left_winking and not self.is_right_winking:
+            if l_ear > 0.14 and r_ear > 0.14:
+                self.baseline_l_ear = 0.99 * self.baseline_l_ear + 0.01 * l_ear
+                self.baseline_r_ear = 0.99 * self.baseline_r_ear + 0.01 * r_ear
+            if 0.005 < mar < 0.035:
+                self.baseline_mar = 0.99 * self.baseline_mar + 0.01 * mar
 
     def process_frame(
-        self, 
-        landmarks: np.ndarray, 
+        self,
+        landmarks: np.ndarray,
         current_time: float,
-        is_mirrored: bool = True
+        pitch_angle: float = 0.0,
+        tilt_y: float = 0.0,
+        is_mirrored: bool = True,
+        **kwargs
     ) -> Dict[str, Any]:
         """
-        Processes facial landmarks and evaluates eye/mouth gestures with asymmetry ratio.
+        Evaluate facial gestures using calibrated relative eye closure drops.
         """
-        # Distinguish user's physical left eye vs physical right eye
-        # In a mirrored frame (default for webcams):
-        # User's Left Eye appears on the Left of the screen (smaller X coords) -> EYE_LEFT_ANATOMIC
-        # User's Right Eye appears on the Right of the screen (larger X coords) -> EYE_RIGHT_ANATOMIC
-        if is_mirrored:
-            l_indices = self.EYE_LEFT_ANATOMIC
-            r_indices = self.EYE_RIGHT_ANATOMIC
-        else:
-            l_indices = self.EYE_RIGHT_ANATOMIC
-            r_indices = self.EYE_LEFT_ANATOMIC
+        # User physical Left Eye vs Right Eye landmarks
+        l_indices = self.EYE_LEFT_ANATOMIC
+        r_indices = self.EYE_RIGHT_ANATOMIC
 
         l_ear = self.calculate_ear(l_indices, landmarks)
         r_ear = self.calculate_ear(r_indices, landmarks)
@@ -120,26 +114,56 @@ class GestureEngine:
 
         self.update_baseline(l_ear, r_ear, mar)
 
-        # Dynamic absolute thresholds based on calibrated/tracked baseline
-        l_thresh = self.baseline_l_ear * self.ear_threshold_ratio
-        r_thresh = self.baseline_r_ear * self.ear_threshold_ratio
+        # Calibrated relative drops (0.0 = wide open, > 0.12 = closing/closed)
+        drop_l = (self.baseline_l_ear - l_ear) / max(self.baseline_l_ear, 1e-4)
+        drop_r = (self.baseline_r_ear - r_ear) / max(self.baseline_r_ear, 1e-4)
 
-        # Asymmetry calculation (|L - R| / max(L, R))
-        max_ear = max(l_ear, r_ear, 1e-6)
-        asymmetry = abs(l_ear - r_ear) / max_ear
-
-        trigger_action = None
+        trigger_action: Optional[str] = None
         hold_progress = 0.0
-        drag_progress = 0.0
 
-        l_closed = l_ear < l_thresh
-        r_closed = r_ear < r_thresh
+        # Physical mouth opening verification:
+        # Check inner lip vertical pixel distance and outer mouth aspect ratio.
+        # This completely prevents head-lift perspective foreshortening from falsely tripping mouth open!
+        inner_lip_px = abs(float(landmarks[14][1] - landmarks[13][1]))
+        outer_lip_px = abs(float(landmarks[17][1] - landmarks[0][1]))
+        mouth_w = np.linalg.norm(landmarks[78][:2] - landmarks[308][:2])
         
-        # Mouth open gesture
-        self.mouth_opened = mar > (self.baseline_mar * 2.2)
+        # Genuine opening requires physical separation of inner lips AND elevated aspect ratio
+        is_inner_open = (inner_lip_px >= 3.0) or (outer_lip_px >= 6.0 and inner_lip_px >= 1.5)
+        is_mar_high = (mar >= 0.08) or (mar >= max(0.06, self.baseline_mar * 2.5))
+        
+        self.mouth_opened = bool(is_inner_open and is_mar_high)
 
-        # 1. Dual-Eye Blink (Hold Click or Drag Toggle)
-        if l_closed and r_closed:
+        # Track mouth open duration
+        if self.mouth_opened:
+            if self.mouth_open_start_time is None:
+                self.mouth_open_start_time = current_time
+        else:
+            self.mouth_open_start_time = None
+
+        mouth_hold_elapsed = (current_time - self.mouth_open_start_time) if self.mouth_open_start_time else 0.0
+
+        # ── SCROLL: Genuine Mouth Open + Head Tilt ────────────────────
+        if self.mouth_opened and mouth_hold_elapsed >= self.scroll_hold_time:
+            is_up = (tilt_y < -9.0) or (pitch_angle > max(5.0, self.scroll_pitch_deadzone))
+            is_down = (tilt_y > 9.0) or (pitch_angle < -max(5.0, self.scroll_pitch_deadzone))
+
+            if is_up:
+                trigger_action = 'scroll_up'
+            elif is_down:
+                trigger_action = 'scroll_down'
+
+        # Closure classifications
+        diff = abs(drop_l - drop_r)
+        # Dual blink: both eyes drop significantly
+        is_dual_blink = (drop_l >= 0.12 and drop_r >= 0.12 and diff < 0.22)
+        
+        # Asymmetric wink: winking eye drops >= 0.12, other eye drops noticeably less
+        is_left_wink = (drop_l >= 0.12 and (drop_l - drop_r >= 0.06)) and not is_dual_blink
+        is_right_wink = (drop_r >= 0.12 and (drop_r - drop_l >= 0.06)) and not is_dual_blink
+
+        # ── DUAL-EYE BLINK → Double Click (0.35s hold) ───────────────
+        if is_dual_blink:
             self.is_blinking = True
             self.is_left_winking = False
             self.is_right_winking = False
@@ -150,27 +174,19 @@ class GestureEngine:
                 self.blink_start_time = current_time
 
             elapsed = current_time - self.blink_start_time
-            hold_progress = min(1.0, elapsed / self.blink_hold_time)
-            
-            if elapsed >= self.drag_hold_time:
-                drag_progress = min(1.0, (elapsed - self.blink_hold_time) / (self.drag_hold_time - self.blink_hold_time))
+            hold_progress = min(1.0, elapsed / self.double_click_hold_time)
+
+            if elapsed >= self.double_click_hold_time:
                 if (current_time - self.last_click_time) > self.click_cooldown:
-                    self.is_dragging = not self.is_dragging
-                    trigger_action = 'toggle_drag'
+                    trigger_action = 'double_click'
                     self.last_click_time = current_time
                     self.blink_start_time = None
-            elif elapsed >= self.blink_hold_time and not self.is_dragging:
-                if (current_time - self.last_click_time) > self.click_cooldown:
-                    trigger_action = 'left_click'
-                    self.last_click_time = current_time
-                    # Keep start time alive in case user continues holding for drag
         else:
             self.is_blinking = False
             self.blink_start_time = None
 
-        # 2. Left Eye Wink (User winks their left eye -> Left Click)
-        # Condition: Left is closed relative to its baseline AND significant asymmetry over Right
-        if not self.is_blinking and (l_ear < l_thresh or asymmetry > self.asymmetry_threshold) and (l_ear < r_ear * 0.75):
+        # ── LEFT WINK → Left Click (0.12s hold) ──────────────────────
+        if not self.is_blinking and is_left_wink:
             self.is_left_winking = True
             self.is_right_winking = False
             self.right_wink_start_time = None
@@ -191,9 +207,8 @@ class GestureEngine:
                 self.is_left_winking = False
                 self.left_wink_start_time = None
 
-        # 3. Right Eye Wink (User winks their right eye -> Right Click)
-        # Condition: Right is closed relative to its baseline AND significant asymmetry over Left
-        if not self.is_blinking and (r_ear < r_thresh or asymmetry > self.asymmetry_threshold) and (r_ear < l_ear * 0.75):
+        # ── RIGHT WINK → Right Click (0.12s hold) ─────────────────────
+        if not self.is_blinking and is_right_wink:
             self.is_right_winking = True
             self.is_left_winking = False
             self.left_wink_start_time = None
@@ -215,25 +230,21 @@ class GestureEngine:
                 self.right_wink_start_time = None
 
         return {
-            'left_ear': l_ear,
-            'right_ear': r_ear,
-            'baseline_l_ear': self.baseline_l_ear,
-            'baseline_r_ear': self.baseline_r_ear,
-            'mar': mar,
-            'mouth_opened': self.mouth_opened,
-            'asymmetry': asymmetry,
-            'is_blinking': self.is_blinking,
+            'left_ear':        l_ear,
+            'right_ear':       r_ear,
+            'drop_l':          drop_l,
+            'drop_r':          drop_r,
+            'baseline_l_ear':  self.baseline_l_ear,
+            'baseline_r_ear':  self.baseline_r_ear,
+            'mar':             mar,
+            'mouth_opened':    self.mouth_opened,
+            'is_blinking':     self.is_blinking,
             'is_left_winking': self.is_left_winking,
             'is_right_winking': self.is_right_winking,
-            'is_dragging': self.is_dragging,
-            'trigger_action': trigger_action,
-            'hold_progress': hold_progress,
-            'drag_progress': drag_progress
+            'trigger_action':  trigger_action,
+            'hold_progress':   hold_progress,
         }
 
     def should_suppress_cursor(self) -> bool:
-        """Suppresses cursor motion during active wink/blink to prevent cursor jump."""
-        return self.is_blinking or self.is_left_winking or self.is_right_winking
-
-    def is_outside_deadzone(self, dx: float, dy: float) -> bool:
-        return (abs(dx) > self.deadzone_x) or (abs(dy) > self.deadzone_y)
+        """Suppress cursor motion during intentional clicks or scrolling."""
+        return self.is_left_winking or self.is_right_winking or self.is_blinking or self.mouth_opened

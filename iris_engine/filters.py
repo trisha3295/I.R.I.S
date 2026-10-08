@@ -68,3 +68,25 @@ class OneEuroFilter2D:
     def reset(self, t0: float, x0: float, y0: float) -> None:
         self.filter_x.reset(t0, x0)
         self.filter_y.reset(t0, y0)
+
+
+class SoftDeadzone2D:
+    """
+    Continuous cubic Hermite deadzone filter. Eliminates jump discontinuities
+    and laddering stepping artifacts in pointer displacement.
+    """
+    def __init__(self, inner_radius: float = 1.0, outer_radius: float = 4.5):
+        self.inner_radius = inner_radius
+        self.outer_radius = outer_radius
+
+    def apply(self, dx: float, dy: float) -> tuple[float, float, float]:
+        speed = math.hypot(dx, dy)
+        if speed <= self.inner_radius:
+            return 0.0, 0.0, 0.0
+        elif speed >= self.outer_radius:
+            return dx, dy, speed
+        else:
+            t = (speed - self.inner_radius) / (self.outer_radius - self.inner_radius)
+            factor = t * t * (3.0 - 2.0 * t)
+            return dx * factor, dy * factor, speed
+

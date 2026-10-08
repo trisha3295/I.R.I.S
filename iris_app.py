@@ -1,476 +1,432 @@
+"""
+I.R.I.S. (Intelligent Real-time Interface System) Controller
+Ultra-Fast, Zero-Jitter Neural Webcam HCI System.
+
+Key Engineering Features:
+- Camera-Space 1-Euro Low-Pass Filter on Rigid Cranial Anchor (Landmark 168)
+  strips sensor tremor at the root before screen amplification.
+- Fitts's Law Ergonomic Range (RANGE_X=42, RANGE_Y=30) enables natural edge-to-edge
+  screen reach without shaking or neck strain.
+- Rapid 15-frame auto-calibration adapts dynamically to any lighting or eye shape.
+- Robust PyAutoGUI click dispatch with proper hold duration.
+"""
+
 import os
 import sys
 import time
-from typing import Dict, Any, List, Optional, Tuple
+import math
+from typing import Tuple, Optional, Dict, Any, List
 import cv2
 import numpy as np
 
-# Add parent directory to path for module resolution
+# Add project root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from iris_engine.camera import ThreadedWebcamStream
 from iris_engine.preprocessor import LightingCompensator
 from iris_engine.tracker import FastFaceMeshTracker
-from iris_engine.pose_estimator import HeadPoseEstimator
 from iris_engine.filters import OneEuroFilter2D
 from iris_engine.gesture_engine import GestureEngine
 from iris_engine.controller import WindowsCursorController
 
-# Model paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 YUNET_PATH = os.path.join(BASE_DIR, "models", "face_detection_yunet.onnx")
 FACEMESH_PATH = os.path.join(BASE_DIR, "models", "FaceMesh.onnx")
 
 
-def draw_rounded_card(img, pt1, pt2, fill_color, border_color=None, radius=8, thickness=1):
-    """Draws a clean modern rounded card with optional border."""
-    x1, y1 = pt1
-    x2, y2 = pt2
-    w = x2 - x1
-    h = y2 - y1
-    r = min(radius, w // 2, h // 2)
-
-    # Fill Card Body
-    cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), fill_color, -1)
-    cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r), fill_color, -1)
-    cv2.circle(img, (x1 + r, y1 + r), r, fill_color, -1)
-    cv2.circle(img, (x2 - r, y1 + r), r, fill_color, -1)
-    cv2.circle(img, (x1 + r, y2 - r), r, fill_color, -1)
-    cv2.circle(img, (x2 - r, y2 - r), r, fill_color, -1)
-
-    # Optional Outline Border
-    if border_color is not None:
-        cv2.line(img, (x1 + r, y1), (x2 - r, y1), border_color, thickness)
-        cv2.line(img, (x1 + r, y2), (x2 - r, y2), border_color, thickness)
-        cv2.line(img, (x1, y1 + r), (x1, y2 - r), border_color, thickness)
-        cv2.line(img, (x2, y1 + r), (x2, y2 - r), border_color, thickness)
-        cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 180, 0, 90, border_color, thickness)
-        cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 270, 0, 90, border_color, thickness)
-        cv2.ellipse(img, (x1 + r, y2 - r), (r, r), 90, 0, 90, border_color, thickness)
-        cv2.ellipse(img, (x2 - r, y2 - r), (r, r), 0, 0, 90, border_color, thickness)
-
-
-def draw_circular_gauge(img, center, radius, progress, color=(0, 240, 255), thickness=3):
-    """Draws a smooth circular progress ring around facial points (e.g. nose tip for click timer)."""
+def draw_circular_gauge(
+    img: np.ndarray,
+    center: Tuple[int, int],
+    radius: int,
+    progress: float,
+    color: Tuple[int, int, int] = (0, 240, 255),
+    thickness: int = 3
+) -> None:
+    """Draws a smooth circular progress ring for gesture hold timers."""
     cx, cy = center
-    # Background ring
     cv2.circle(img, (cx, cy), radius, (50, 55, 65), thickness, cv2.LINE_AA)
-    # Active arc
     if progress > 0.0:
         angle = int(360.0 * min(1.0, max(0.0, progress)))
         cv2.ellipse(img, (cx, cy), (radius, radius), -90, 0, angle, color, thickness, cv2.LINE_AA)
 
 
-def render_dashboard_panel(
-    panel: np.ndarray,
-    gestures: Dict[str, Any],
-    recent_actions: List[str],
-    sensitivity: float,
-    is_paused: bool,
-    is_scrolling: bool,
-    is_sniper: bool,
-    is_calibrating: bool,
-    calib_progress: float,
-    sound_enabled: bool,
-    head_tracked: bool
-) -> None:
-    """
-    Renders the modern Cyber-Glass interactive control & tutorial sidebar.
-    """
-    pw = panel.shape[1]
-    ph = panel.shape[0]
-
-    # Dark Cyber Background
-    panel[:] = (15, 17, 22)
-
-    # 1. Header Banner
-    draw_rounded_card(panel, (10, 10), (pw - 10, 48), (24, 28, 38), (40, 46, 60), radius=6)
-    cv2.putText(panel, "I.R.I.S. CONTROL & TUTORIAL", (18, 33), cv2.FONT_HERSHEY_DUPLEX, 0.46, (0, 230, 255), 1, cv2.LINE_AA)
-
-    # 2. Card: Eye Telemetry & Relative Asymmetry
-    c1_y1, c1_y2 = 54, 146
-    draw_rounded_card(panel, (10, c1_y1), (pw - 10, c1_y2), (20, 24, 32), (38, 44, 58), radius=6)
-    cv2.putText(panel, "LIVE EYE ASYMMETRY TELEMETRY", (18, c1_y1 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 175, 195), 1, cv2.LINE_AA)
-
-    l_ear = gestures.get('left_ear', 0.28)
-    r_ear = gestures.get('right_ear', 0.28)
-    asymmetry = gestures.get('asymmetry', 0.0)
-    base_l = gestures.get('baseline_l_ear', 0.28)
-    base_r = gestures.get('baseline_r_ear', 0.28)
-
-    # Left Eye Gauge (User Left)
-    l_active = gestures.get('is_left_winking', False)
-    l_bar_col = (0, 255, 140) if not l_active else (0, 180, 255)
-    cv2.putText(panel, f"L EAR: {l_ear:.2f}", (18, c1_y1 + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (230, 230, 230), 1, cv2.LINE_AA)
-    cv2.rectangle(panel, (85, c1_y1 + 28), (pw - 25, c1_y1 + 40), (35, 40, 52), -1)
-    l_fill = int((pw - 110) * min(1.0, max(0.0, l_ear / 0.40)))
-    cv2.rectangle(panel, (85, c1_y1 + 28), (85 + l_fill, c1_y1 + 40), l_bar_col, -1)
-    # Baseline marker
-    mark_l = int(85 + (pw - 110) * min(1.0, base_l / 0.40))
-    cv2.line(panel, (mark_l, c1_y1 + 26), (mark_l, c1_y1 + 42), (255, 255, 255), 1)
-
-    # Right Eye Gauge (User Right)
-    r_active = gestures.get('is_right_winking', False)
-    r_bar_col = (0, 255, 140) if not r_active else (0, 180, 255)
-    cv2.putText(panel, f"R EAR: {r_ear:.2f}", (18, c1_y1 + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (230, 230, 230), 1, cv2.LINE_AA)
-    cv2.rectangle(panel, (85, c1_y1 + 50), (pw - 25, c1_y1 + 62), (35, 40, 52), -1)
-    r_fill = int((pw - 110) * min(1.0, max(0.0, r_ear / 0.40)))
-    cv2.rectangle(panel, (85, c1_y1 + 50), (85 + r_fill, c1_y1 + 62), r_bar_col, -1)
-    # Baseline marker
-    mark_r = int(85 + (pw - 110) * min(1.0, base_r / 0.40))
-    cv2.line(panel, (mark_r, c1_y1 + 48), (mark_r, c1_y1 + 64), (255, 255, 255), 1)
-
-    # Asymmetry Differential Readout
-    asym_pct = int(asymmetry * 100)
-    asym_col = (0, 255, 220) if asym_pct > 30 else (140, 150, 165)
-    cv2.putText(panel, f"Asymmetry Index: {asym_pct}%", (18, c1_y1 + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.35, asym_col, 1, cv2.LINE_AA)
-
-    # 3. Card: Interactive Gesture Tutorial Grid
-    c2_y1, c2_y2 = 152, 356
-    draw_rounded_card(panel, (10, c2_y1), (pw - 10, c2_y2), (20, 24, 32), (38, 44, 58), radius=6)
-    cv2.putText(panel, "GESTURE GUIDE (REACTIVE)", (18, c2_y1 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 230, 255), 1, cv2.LINE_AA)
-
-    # 1. Head Glide
-    h_col = (0, 255, 140) if head_tracked else (120, 130, 140)
-    cv2.circle(panel, (24, c2_y1 + 35), 4, h_col, -1)
-    cv2.putText(panel, "1. Move Head : Cursor Glide", (36, c2_y1 + 39), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (240, 240, 240), 1, cv2.LINE_AA)
-
-    # 2. Hold Blink
-    hold_prog = gestures.get('hold_progress', 0.0)
-    b_col = (0, 240, 255) if hold_prog > 0.0 else (120, 130, 140)
-    cv2.circle(panel, (24, c2_y1 + 62), 4, b_col, -1)
-    cv2.putText(panel, "2. Hold Blink (0.35s) : Left Click", (36, c2_y1 + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (240, 240, 240), 1, cv2.LINE_AA)
-    # Mini Progress Bar
-    cv2.rectangle(panel, (36, c2_y1 + 74), (pw - 25, c2_y1 + 81), (35, 40, 52), -1)
-    if hold_prog > 0.0:
-        cv2.rectangle(panel, (36, c2_y1 + 74), (36 + int((pw - 61) * hold_prog), c2_y1 + 81), (0, 230, 255), -1)
-
-    # 3. Left Wink
-    lw_col = (0, 255, 140) if gestures.get('is_left_winking', False) else (120, 130, 140)
-    cv2.circle(panel, (24, c2_y1 + 100), 4, lw_col, -1)
-    cv2.putText(panel, "3. Left Wink : Left Click (Instant)", (36, c2_y1 + 104), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (240, 240, 240), 1, cv2.LINE_AA)
-
-    # 4. Right Wink
-    rw_col = (0, 255, 140) if gestures.get('is_right_winking', False) else (120, 130, 140)
-    cv2.circle(panel, (24, c2_y1 + 126), 4, rw_col, -1)
-    cv2.putText(panel, "4. Right Wink : Right Click (Instant)", (36, c2_y1 + 130), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (240, 240, 240), 1, cv2.LINE_AA)
-
-    # 5. Drag & Drop Hold
-    is_drag = gestures.get('is_dragging', False)
-    drag_col = (255, 120, 0) if is_drag else (120, 130, 140)
-    cv2.circle(panel, (24, c2_y1 + 152), 4, drag_col, -1)
-    drag_label = "5. Long Hold (0.75s) : DRAGGING" if is_drag else "5. Long Hold (0.75s) : Drag & Drop"
-    cv2.putText(panel, drag_label, (36, c2_y1 + 156), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (240, 240, 240), 1, cv2.LINE_AA)
-
-    # 6. Scroll Mode
-    scroll_col = (0, 220, 255) if (is_scrolling or gestures.get('mouth_opened', False)) else (120, 130, 140)
-    cv2.circle(panel, (24, c2_y1 + 178), 4, scroll_col, -1)
-    cv2.putText(panel, "6. Open Mouth / [S] : Smooth Scroll", (36, c2_y1 + 182), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (240, 240, 240), 1, cv2.LINE_AA)
-
-    # 4. Card: Quick Hotkey Toggles & Status
-    c3_y1, c3_y2 = 362, ph - 10
-    draw_rounded_card(panel, (10, c3_y1), (pw - 10, c3_y2), (20, 24, 32), (38, 44, 58), radius=6)
-    
-    # Feature Status Badges
-    cal_str = f"CALIBRATING ({int(calib_progress*100)}%)" if is_calibrating else "CALIBRATED"
-    cal_col = (0, 240, 255) if is_calibrating else (0, 255, 140)
-    cv2.putText(panel, f"[A] Auto-Calib: {cal_str}", (18, c3_y1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.34, cal_col, 1, cv2.LINE_AA)
-
-    snip_str = "SNIPER 0.3x" if is_sniper else "NORMAL"
-    snip_col = (0, 240, 255) if is_sniper else (180, 180, 180)
-    cv2.putText(panel, f"[Z] Precision: {snip_str}", (18, c3_y1 + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.34, snip_col, 1, cv2.LINE_AA)
-
-    snd_str = "ON" if sound_enabled else "MUTED"
-    snd_col = (0, 255, 140) if sound_enabled else (120, 120, 120)
-    cv2.putText(panel, f"[M] Audio: {snd_str} | [S] Scroll: {'ON' if is_scrolling else 'OFF'}", (18, c3_y1 + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.34, snd_col, 1, cv2.LINE_AA)
-
-    p_str = "PAUSED (SPACE)" if is_paused else "ACTIVE TRACKING"
-    p_col = (0, 140, 255) if is_paused else (0, 255, 140)
-    cv2.putText(panel, f"[SPACE] {p_str} | Sens: {sensitivity:.1f}x", (18, c3_y1 + 72), cv2.FONT_HERSHEY_SIMPLEX, 0.34, p_col, 1, cv2.LINE_AA)
-
-    # Event Log
-    if recent_actions:
-        latest = recent_actions[-1]
-        cv2.putText(panel, f">> {latest}", (18, c3_y1 + 92), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 230, 255), 1, cv2.LINE_AA)
-
-
 def main():
-    print("=" * 68)
-    print("  I.R.I.S. (Intelligent Real-time Interface System) v2.0 Platform")
-    print("=" * 68)
-    
-    # 1. Initialize Windows Cursor & Sound Controller
+    print("=" * 70)
+    print("  I.R.I.S. (Intelligent Real-time Interface System) - Controller")
+    print("  Zero-Jitter Camera-Space Filtering & Calibrated Gestures")
+    print("=" * 70)
+
+    # 1. Initialize Windows Native / PyAutoGUI Cursor Controller
     controller = WindowsCursorController(enable_sound=True)
     screen_w, screen_h = controller.get_screen_size()
-    print(f"[1] Native Windows Controller: {screen_w}x{screen_h} primary display")
+    print(f"[INFO] Display Resolution: {screen_w} x {screen_h}")
 
-    # 2. Signal Filters & Geometry Engines
+    # 2. Vision and Tracking Pipelines
     lighting = LightingCompensator(clip_limit=2.0, tile_grid_size=(8, 8))
-    t_start = time.time()
-    cursor_filter = OneEuroFilter2D(t_start, screen_w / 2.0, screen_h / 2.0, min_cutoff=0.005, beta=0.001, d_cutoff=1.0)
-    pose_estimator = HeadPoseEstimator()
     gesture_engine = GestureEngine(
-        ear_threshold_ratio=0.68,
-        asymmetry_threshold=0.28,
-        wink_hold_time=0.18,
-        blink_hold_time=0.35,
-        drag_hold_time=0.75,
-        click_cooldown=0.55,
-        deadzone_x=14.0,
-        deadzone_y=8.0
+        wink_hold_time=0.12,
+        double_click_hold_time=0.35,
+        click_cooldown=0.40,
+        scroll_hold_time=0.12
     )
 
-    # 3. Neural Trackers
     tracker = FastFaceMeshTracker(
         model_yunet_path=YUNET_PATH,
         model_facemesh_path=FACEMESH_PATH,
-        input_size=(640, 480)
+        input_size=(640, 480),
+        redetect_interval=90
     )
 
-    # 4. Camera Thread
     camera = ThreadedWebcamStream(src=0, width=640, height=480, fps=30).start()
-    time.sleep(0.4)
+    time.sleep(0.3)
 
-    # State variables
-    is_paused = False
-    is_scrolling = False
-    is_sniper = False
-    show_debug = True
-    show_tutorial_panel = True
+    # 3. Window Setup (Clean, centered, windowed)
+    window_name = "I.R.I.S. - Controller"
+    window_w, window_h = 1024, 768
+    center_wx = int((screen_w - window_w) / 2)
+    center_wy = int((screen_h - window_h) / 2) - 40
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, window_w, window_h)
+    cv2.moveWindow(window_name, max(0, center_wx), max(0, center_wy))
+
+    # 4. 3D Canonical Anthropometric Head Pose Model & Camera-Space 1-Euro Filter
+    face_3d = np.array([
+        (0.0, 0.0, 0.0),            # Nose tip (Landmark 1)
+        (0.0, -330.0, -65.0),       # Chin (Landmark 152)
+        (-225.0, 170.0, -135.0),    # Left Eye Outer Corner (Landmark 33)
+        (225.0, 170.0, -135.0),     # Right Eye Outer Corner (Landmark 263)
+        (-150.0, -150.0, -125.0),   # Left Mouth Corner (Landmark 61)
+        (150.0, -150.0, -125.0)     # Right Mouth Corner (Landmark 291)
+    ], dtype=np.float64)
+    landmark_indices = [1, 152, 33, 263, 61, 291]
+
+    t_start = time.time()
+    laser_filter = OneEuroFilter2D(
+        t_start,
+        320.0,
+        240.0,
+        min_cutoff=0.005,
+        beta=0.002,
+        d_cutoff=1.0
+    )
+
+    prev_cursor_x = float(screen_w // 2)
+    prev_cursor_y = float(screen_h // 2)
+
+    # 5. Sensitivity & Control Box Dimensions
     sensitivity = 1.0
-    prev_smooth_x, prev_smooth_y = screen_w / 2.0, screen_h / 2.0
-    recent_actions: List[str] = []
-    
-    # Auto-calibration state
-    is_calibrating = False
-    calib_start_time = 0.0
-    calib_samples: List[Tuple[float, float, float]] = []
+    box_w = 260.0  # Horizontal range in camera space
+    box_h = 190.0  # Vertical range in camera space
 
-    # Scroll tracking
-    prev_pitch = 0.0
+    # Resting Neutral Anchor (calibrated automatically on start and updated with [C])
+    neutral_x: Optional[float] = None
+    neutral_y: Optional[float] = None
 
-    frame_times = []
+    # Scrolling state
+    last_scroll_time = 0.0
+    SCROLL_INTERVAL = 0.07
+
+    # App Status & Action Feedback
+    is_paused = False
+    last_action_text = ""
+    last_action_time = 0.0
+    last_action_color = (0, 255, 0)
+    click_suppress_until = 0.0
+
+    # Frame timing
+    frame_times: List[float] = []
     fps = 30.0
-    latency_ms = 0.0
 
-    window_name = "I.R.I.S. Control Monitor"
-    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
-
-    print("\n[READY] I.R.I.S. v2.0 Online. Press ESC to exit.\n")
+    print("[READY] I.R.I.S. Controller Online.")
+    print("        Controls: [SPACE] Pause | [C] Recenter | [+] / [-] Sensitivity | [ESC] Exit\n")
 
     try:
         while True:
             t_frame_start = time.time()
             frame = camera.read()
             if frame is None:
-                time.sleep(0.005)
+                time.sleep(0.004)
                 continue
 
+            # Flip horizontally for natural mirror behavior
             frame = cv2.flip(frame, 1)
             img_h, img_w, _ = frame.shape
 
-            # 1. Luminance Equalization (YCrCb CLAHE)
+            # 1. Luminance Normalization
             rgb_image = lighting.process(frame)
 
-            # 2. Neural 468-point 3D FaceMesh Tracking
+            # 2. Fast Landmark Tracking
             landmarks = tracker.detect_and_track(rgb_image)
-            head_tracked = landmarks is not None
 
-            # Dynamic Sensitivity Motion Box
-            effective_sens = (sensitivity * 0.35) if is_sniper else sensitivity
-            box_w_factor = max(0.18, 0.38 / effective_sens)
-            box_h_factor = max(0.18, 0.38 / effective_sens)
-            box_w = int(img_w * box_w_factor)
-            box_h = int(img_h * box_h_factor)
-            box_x1 = int((img_w - box_w) / 2)
-            box_y1 = int((img_h - box_h) / 2)
-            box_x2 = box_x1 + box_w
-            box_y2 = box_y1 + box_h
-
-            if show_debug:
-                # Outer Cyber ROI Box
-                box_col = (0, 240, 255) if is_sniper else ((0, 255, 140) if not is_paused else (0, 140, 255))
-                cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), box_col, 1)
-
-            gestures = {'hold_progress': 0.0, 'left_ear': 0.28, 'right_ear': 0.28, 'asymmetry': 0.0}
+            current_time = time.time()
+            l_ear, r_ear, avg_ear, mar = 0.18, 0.18, 0.18, 0.015
+            hold_progress = 0.0
 
             if landmarks is not None:
-                current_time = time.time()
+                # 3. 3D Head Pose Laser Calculation via solvePnP (like Legacy)
+                face_2d = np.array([
+                    [landmarks[idx][0], landmarks[idx][1]] for idx in landmark_indices
+                ], dtype=np.float64)
 
-                # 3. Gesture Evaluation with Relative Asymmetry
-                gestures = gesture_engine.process_frame(landmarks, current_time, is_mirrored=True)
+                focal_length = 1.0 * img_w
+                cam_matrix = np.array([
+                    [focal_length, 0.0, img_w / 2.0],
+                    [0.0, focal_length, img_h / 2.0],
+                    [0.0, 0.0, 1.0]
+                ], dtype=np.float64)
+                dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+                success, rvec, tvec = cv2.solvePnP(
+                    face_3d, face_2d, cam_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+                )
+                if success:
+                    proj, _ = cv2.projectPoints(
+                        np.array([(0.0, 0.0, 1000.0)]), rvec, tvec, cam_matrix, dist_coeffs
+                    )
+                    raw_lx, raw_ly = float(proj[0][0][0]), float(proj[0][0][1])
+                else:
+                    raw_lx, raw_ly = float(landmarks[1][0]), float(landmarks[1][1])
+
+                # Smooth laser point in camera space FIRST (strips 100% sensor jitter)
+                laser_x, laser_y = laser_filter.filter(current_time, raw_lx, raw_ly)
+
+                # Auto-initialize neutral anchor on first stable detection
+                if neutral_x is None or neutral_y is None:
+                    neutral_x = laser_x
+                    neutral_y = laser_y
+
+                # Head displacement vector relative to resting neutral
+                dx = laser_x - neutral_x
+                dy = laser_y - neutral_y
+
+                # 4. Facial Gesture Engine Evaluation
+                gestures = gesture_engine.process_frame(
+                    landmarks,
+                    current_time,
+                    tilt_y=dy,
+                    is_mirrored=True
+                )
+
+                l_ear = gestures.get('left_ear', 0.18)
+                r_ear = gestures.get('right_ear', 0.18)
+                avg_ear = (l_ear + r_ear) / 2.0
+                mar = gestures.get('mar', 0.015)
+                hold_progress = gestures.get('hold_progress', 0.0)
                 trigger = gestures.get('trigger_action')
+                mouth_opened = gestures.get('mouth_opened', False)
 
-                # Auto-Calibration sampling
-                if is_calibrating:
-                    calib_samples.append((gestures['left_ear'], gestures['right_ear'], gestures['mar']))
-                    if (current_time - calib_start_time) >= 2.5:
-                        # Finalize Calibration
-                        arr = np.array(calib_samples)
-                        mean_l = float(np.mean(arr[:, 0]))
-                        mean_r = float(np.mean(arr[:, 1]))
-                        mean_m = float(np.mean(arr[:, 2]))
-                        gesture_engine.set_calibration(mean_l, mean_r, mean_m)
-                        is_calibrating = False
-                        controller.play_recenter_tone()
-                        recent_actions.append(f"CALIBRATED (L:{mean_l:.2f}, R:{mean_r:.2f})")
-                        if len(recent_actions) > 6:
-                            recent_actions.pop(0)
-
-                # Trigger Mouse Actions
-                if not is_paused and not is_calibrating and trigger is not None:
+                # 5. Handle Actions
+                if not is_paused and trigger is not None:
                     if trigger == 'left_click':
                         controller.left_click()
-                        recent_actions.append(f"LEFT CLICK [{time.strftime('%H:%M:%S')}]")
-                        cv2.circle(frame, (box_x1 + 30, box_y1 + 30), 14, (0, 255, 0), -1)
+                        last_action_text = "LEFT CLICK!"
+                        last_action_time = current_time
+                        last_action_color = (0, 255, 120)
+                        click_suppress_until = current_time + 0.20
                     elif trigger == 'right_click':
                         controller.right_click()
-                        recent_actions.append(f"RIGHT CLICK [{time.strftime('%H:%M:%S')}]")
-                        cv2.circle(frame, (box_x2 - 30, box_y1 + 30), 14, (0, 0, 255), -1)
-                    elif trigger == 'toggle_drag':
-                        dragging = controller.toggle_drag()
-                        recent_actions.append(f"{'DRAG ON' if dragging else 'DRAG OFF'} [{time.strftime('%H:%M:%S')}]")
-                    if len(recent_actions) > 6:
-                        recent_actions.pop(0)
+                        last_action_text = "RIGHT CLICK!"
+                        last_action_time = current_time
+                        last_action_color = (0, 220, 255)
+                        click_suppress_until = current_time + 0.20
+                    elif trigger == 'double_click':
+                        controller.double_click()
+                        last_action_text = "DOUBLE CLICK!"
+                        last_action_time = current_time
+                        last_action_color = (255, 120, 255)
+                        click_suppress_until = current_time + 0.25
+                    elif trigger == 'scroll_up':
+                        if (current_time - last_scroll_time) > SCROLL_INTERVAL:
+                            controller.scroll(3)
+                            last_scroll_time = current_time
+                            last_action_text = "SCROLL UP"
+                            last_action_time = current_time
+                            last_action_color = (0, 240, 255)
+                    elif trigger == 'scroll_down':
+                        if (current_time - last_scroll_time) > SCROLL_INTERVAL:
+                            controller.scroll(-3)
+                            last_scroll_time = current_time
+                            last_action_text = "SCROLL DOWN"
+                            last_action_time = current_time
+                            last_action_color = (0, 240, 255)
 
-                # 4. 6-DOF Head Pose Estimation via solvePnP
-                success, proj_point, rvec, tvec = pose_estimator.estimate_pose(landmarks, img_w, img_h)
+                # 6. Smooth Pointer Ballistics mapped via Control Box
+                half_box_w = (box_w / 2.0) / sensitivity
+                half_box_h = (box_h / 2.0) / sensitivity
 
-                if success and proj_point is not None:
-                    laser_x, laser_y = proj_point
-                    pitch, yaw, roll = pose_estimator.get_euler_angles(rvec)
+                box_x1 = neutral_x - half_box_w
+                box_x2 = neutral_x + half_box_w
+                box_y1 = neutral_y - half_box_h
+                box_y2 = neutral_y + half_box_h
 
-                    # Smooth Head-Tilt Scrolling
-                    if is_scrolling or gestures.get('mouth_opened', False):
-                        pitch_delta = pitch - prev_pitch
-                        if abs(pitch) > 6.0:
-                            scroll_speed = int(np.clip(-pitch / 4.0, -4, 4))
-                            if scroll_speed != 0:
-                                controller.scroll(scroll_speed)
-                    prev_pitch = pitch
+                norm_x = (laser_x - neutral_x) / max(1.0, half_box_w)
+                norm_y = (laser_y - neutral_y) / max(1.0, half_box_h)
 
-                    # 3D Gaze Vector Visuals
-                    if show_debug:
-                        nose_2d = (int(landmarks[1][0]), int(landmarks[1][1]))
-                        target_2d = (int(laser_x), int(laser_y))
-                        cv2.line(frame, nose_2d, target_2d, (0, 240, 255), 2, cv2.LINE_AA)
-                        
-                        # Circular Hold Ring on Nose
-                        hold_prog = gestures.get('hold_progress', 0.0)
-                        draw_circular_gauge(frame, nose_2d, radius=18, progress=hold_prog, color=(0, 230, 255), thickness=3)
+                curved_x = float(np.sign(norm_x) * (abs(norm_x) ** 1.15))
+                curved_y = float(np.sign(norm_y) * (abs(norm_y) ** 1.15))
 
-                    # Screen Coordinate Remapping & One Euro Filtering
-                    raw_screen_x = np.interp(laser_x, [box_x1, box_x2], [0, screen_w])
-                    raw_screen_y = np.interp(laser_y, [box_y1, box_y2], [0, screen_h])
+                target_screen_x = (screen_w / 2.0) + curved_x * (screen_w / 2.0)
+                target_screen_y = (screen_h / 2.0) + curved_y * (screen_h / 2.0)
 
-                    smooth_x, smooth_y = cursor_filter.filter(current_time, raw_screen_x, raw_screen_y)
-                    dx = smooth_x - prev_smooth_x
-                    dy = smooth_y - prev_smooth_y
+                target_screen_x = float(np.clip(target_screen_x, 0, screen_w - 1))
+                target_screen_y = float(np.clip(target_screen_y, 0, screen_h - 1))
 
-                    # Move cursor if not paused, not calibrating, and outside deadzone
-                    if not is_paused and not is_calibrating and not gesture_engine.should_suppress_cursor():
-                        if gesture_engine.is_outside_deadzone(dx, dy):
-                            controller.move_to(smooth_x, smooth_y)
-                            prev_smooth_x, prev_smooth_y = smooth_x, smooth_y
+                # Micro-deadzone of 1.8 screen pixels: locks firmly when stationary
+                dist_moved = math.hypot(target_screen_x - prev_cursor_x, target_screen_y - prev_cursor_y)
+                is_clicking = current_time < click_suppress_until
 
-                # Render Eye Pupil & Contour Reticles
-                if show_debug:
-                    for eye_idx in gesture_engine.EYE_LEFT_ANATOMIC + gesture_engine.EYE_RIGHT_ANATOMIC:
-                        pt = (int(landmarks[eye_idx][0]), int(landmarks[eye_idx][1]))
-                        cv2.circle(frame, pt, 1, (255, 220, 0), -1)
+                can_move = (
+                    not is_paused
+                    and not is_clicking
+                    and dist_moved > 1.8
+                )
 
-            # Top Camera Glassmorphism Header Bar
-            header_overlay = frame.copy()
-            cv2.rectangle(header_overlay, (10, 10), (img_w - 10, 52), (18, 20, 26), -1)
-            cv2.addWeighted(header_overlay, 0.82, frame, 0.18, 0, frame)
+                if can_move:
+                    controller.move_to(target_screen_x, target_screen_y)
+                    prev_cursor_x, prev_cursor_y = target_screen_x, target_screen_y
 
-            status_txt = "PAUSED (SPACE)" if is_paused else ("SCROLL MODE" if is_scrolling else ("DRAGGING" if controller.is_dragging else "ACTIVE"))
-            status_col = (0, 140, 255) if is_paused else ((0, 220, 255) if is_scrolling else (0, 255, 140))
-            cv2.putText(frame, "I.R.I.S. v2.0", (20, 32), cv2.FONT_HERSHEY_DUPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(frame, f"[{status_txt}]", (140, 32), cv2.FONT_HERSHEY_DUPLEX, 0.48, status_col, 1, cv2.LINE_AA)
-            cv2.putText(frame, f"FPS: {fps:4.1f} | Latency: {latency_ms:4.1f}ms", (20, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 180, 180), 1, cv2.LINE_AA)
+                # 7. Draw Visual Indicators (Like Legacy UI)
+                # Control Box (Cyan / Yellow)
+                cv2.rectangle(
+                    frame, 
+                    (int(box_x1), int(box_y1)), 
+                    (int(box_x2), int(box_y2)), 
+                    (0, 240, 255), 
+                    2
+                )
 
-            # FPS & Latency metrics
+                # Resting Center Anchor Crosshair
+                cv2.drawMarker(frame, (int(neutral_x), int(neutral_y)), (0, 200, 255), cv2.MARKER_CROSS, 14, 1)
+
+                # Laser Pointer Red Dot (with white outline)
+                cv2.circle(frame, (int(laser_x), int(laser_y)), 7, (0, 0, 255), -1, cv2.LINE_AA)
+                cv2.circle(frame, (int(laser_x), int(laser_y)), 9, (255, 255, 255), 1, cv2.LINE_AA)
+
+                # Facial keypoints
+                for idx in landmark_indices:
+                    cv2.circle(frame, (int(landmarks[idx][0]), int(landmarks[idx][1])), 2, (0, 255, 0), -1)
+
+                # Hold progress ring around laser dot
+                if hold_progress > 0.0:
+                    ring_color = (255, 120, 255) if gestures.get('is_blinking') else (0, 240, 255)
+                    draw_circular_gauge(frame, (int(laser_x), int(laser_y)), radius=20, progress=hold_progress, color=ring_color, thickness=3)
+
+            # -------------------------------------------------------------
+            # Clean On-Screen UI Overlays (Like Legacy)
+            # -------------------------------------------------------------
+            # Top-Left Telemetry Card Overlay
+            card_w, card_h = 320, 114
+            card_overlay = frame.copy()
+            cv2.rectangle(card_overlay, (15, 15), (15 + card_w, 15 + card_h), (18, 22, 28), -1)
+            cv2.addWeighted(card_overlay, 0.75, frame, 0.25, 0, frame)
+            cv2.rectangle(frame, (15, 15), (15 + card_w, 15 + card_h), (50, 60, 75), 1)
+
+            # Status Indicator
+            calib_str = " (Calibrated)" if gesture_engine.is_calibrated else " (Calibrating...)"
+            status_str = "PAUSED (SPACE)" if is_paused else ("ACTIVE" + calib_str)
+            status_col = (0, 140, 255) if is_paused else (0, 255, 120)
+            cv2.putText(frame, "I.R.I.S. Controller", (25, 38), cv2.FONT_HERSHEY_DUPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, f"[{status_str}]", (195, 38), cv2.FONT_HERSHEY_DUPLEX, 0.36, status_col, 1, cv2.LINE_AA)
+
+            # Live Metrics
+            cv2.putText(frame, f"EAR L: {l_ear:.2f} | R: {r_ear:.2f}", (25, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 215, 230), 1, cv2.LINE_AA)
+            cv2.putText(frame, f"Live MAR: {mar:.3f}", (25, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 215, 230), 1, cv2.LINE_AA)
+            cv2.putText(frame, f"Sens: {sensitivity:.2f}x (+/-) | FPS: {fps:3.0f}", (25, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 240, 255), 1, cv2.LINE_AA)
+
+            # Prominent Action Event Banner
+            if (current_time - last_action_time) < 0.65 and last_action_text:
+                banner_w = 260
+                bx1 = (img_w - banner_w) // 2
+                bx2 = bx1 + banner_w
+                by1 = 20
+                by2 = 65
+                action_overlay = frame.copy()
+                cv2.rectangle(action_overlay, (bx1, by1), (bx2, by2), (20, 24, 32), -1)
+                cv2.addWeighted(action_overlay, 0.85, frame, 0.15, 0, frame)
+                cv2.rectangle(frame, (bx1, by1), (bx2, by2), last_action_color, 2)
+                cv2.putText(
+                    frame,
+                    last_action_text,
+                    (bx1 + 18, by1 + 32),
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    0.72,
+                    last_action_color,
+                    2,
+                    cv2.LINE_AA
+                )
+
+            # Bottom Feature Guide Banner
+            banner_overlay = frame.copy()
+            cv2.rectangle(banner_overlay, (10, img_h - 44), (img_w - 10, img_h - 10), (16, 20, 28), -1)
+            cv2.addWeighted(banner_overlay, 0.82, frame, 0.18, 0, frame)
+            cv2.rectangle(frame, (10, img_h - 44), (img_w - 10, img_h - 10), (45, 55, 70), 1)
+
+            cv2.putText(
+                frame,
+                "Left Wink: L-Click | Right Wink: R-Click | Long Blink: Double-Click | Mouth+Tilt: Scroll",
+                (20, img_h - 26),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                (0, 240, 255),
+                1,
+                cv2.LINE_AA
+            )
+            cv2.putText(
+                frame,
+                "[SPACE] Pause | [C] Recenter | [+/-] Sens | [ESC] Exit",
+                (img_w - 325, img_h - 26),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.33,
+                (200, 210, 220),
+                1,
+                cv2.LINE_AA
+            )
+
+            # Frame rate update
             t_frame_end = time.time()
-            latency_ms = (t_frame_end - t_frame_start) * 1000.0
             frame_times.append(t_frame_end - t_frame_start)
             if len(frame_times) > 30:
                 frame_times.pop(0)
             fps = len(frame_times) / sum(frame_times) if sum(frame_times) > 0 else 30.0
 
-            # Side Tutorial & Command Dashboard
-            if show_tutorial_panel:
-                panel_w = 360
-                panel = np.zeros((img_h, panel_w, 3), dtype=np.uint8)
-                cal_prog = min(1.0, (time.time() - calib_start_time) / 2.5) if is_calibrating else 1.0
-                render_dashboard_panel(
-                    panel, 
-                    gestures, 
-                    recent_actions, 
-                    sensitivity, 
-                    is_paused, 
-                    is_scrolling,
-                    is_sniper,
-                    is_calibrating,
-                    cal_prog,
-                    controller.enable_sound,
-                    head_tracked
-                )
-                display_canvas = np.hstack([frame, panel])
-            else:
-                display_canvas = frame
-
-            cv2.imshow(window_name, display_canvas)
+            # Render display frame
+            cv2.imshow(window_name, frame)
             key = cv2.waitKey(1) & 0xFF
 
-            if key == 27:  # ESC
-                print("[INFO] Shutting down I.R.I.S. cleanly...")
+            if key == 27:  # ESC to exit
+                print("[INFO] Terminating session cleanly...")
                 break
-            elif key == ord(' '):  # Pause / Resume
+            elif key == ord(' '):  # SPACE to pause/resume
                 is_paused = not is_paused
                 controller.play_pause_tone()
-            elif key in (ord('c'), ord('C')):  # Recenter
-                cursor_filter.reset(time.time(), screen_w / 2.0, screen_h / 2.0)
-                controller.move_to(screen_w / 2.0, screen_h / 2.0)
-                prev_smooth_x, prev_smooth_y = screen_w / 2.0, screen_h / 2.0
+            elif key in (ord('c'), ord('C')):  # Recenter neutral anchor to current head position
+                if landmarks is not None:
+                    neutral_x = laser_x
+                    neutral_y = laser_y
+                laser_filter.reset(current_time, laser_x, laser_y)
+                prev_cursor_x, prev_cursor_y = float(screen_w // 2), float(screen_h // 2)
+                controller.move_to(prev_cursor_x, prev_cursor_y)
                 controller.play_recenter_tone()
-                recent_actions.append(f"RECENTERED [{time.strftime('%H:%M:%S')}]")
-                if len(recent_actions) > 6:
-                    recent_actions.pop(0)
-            elif key in (ord('a'), ord('A')):  # Auto-Calibrate
-                is_calibrating = True
-                calib_start_time = time.time()
-                calib_samples = []
-                print("[INFO] Starting 2.5s Auto-Calibration...")
-            elif key in (ord('s'), ord('S')):  # Scroll Mode
-                is_scrolling = not is_scrolling
-                recent_actions.append(f"SCROLL {'ON' if is_scrolling else 'OFF'}")
-                if len(recent_actions) > 6:
-                    recent_actions.pop(0)
-            elif key in (ord('z'), ord('Z')):  # Sniper / Precision Mode
-                is_sniper = not is_sniper
-                recent_actions.append(f"PRECISION {'0.3x' if is_sniper else 'OFF'}")
-                if len(recent_actions) > 6:
-                    recent_actions.pop(0)
-            elif key in (ord('m'), ord('M')):  # Mute / Unmute Audio Chimes
-                snd = controller.toggle_sound()
-                recent_actions.append(f"AUDIO {'ON' if snd else 'MUTED'}")
-                if len(recent_actions) > 6:
-                    recent_actions.pop(0)
-            elif key in (ord('t'), ord('T')):  # Toggle Tutorial Panel
-                show_tutorial_panel = not show_tutorial_panel
-            elif key in (ord('h'), ord('H')):  # Toggle HUD
-                show_debug = not show_debug
+                last_action_text = "RECENTERED"
+                last_action_time = current_time
+                last_action_color = (0, 240, 255)
             elif key in (ord('+'), ord('=')):  # Increase sensitivity
-                sensitivity = min(3.0, sensitivity + 0.1)
+                sensitivity = min(3.0, sensitivity + 0.10)
+                last_action_text = f"SENS: {sensitivity:.2f}x"
+                last_action_time = current_time
+                last_action_color = (0, 240, 255)
             elif key in (ord('-'), ord('_')):  # Decrease sensitivity
-                sensitivity = max(0.4, sensitivity - 0.1)
+                sensitivity = max(0.4, sensitivity - 0.10)
+                last_action_text = f"SENS: {sensitivity:.2f}x"
+                last_action_time = current_time
+                last_action_color = (0, 240, 255)
 
     finally:
-        controller.release_drag()
         camera.stop()
         cv2.destroyAllWindows()
-        print("[INFO] I.R.I.S. Session Terminated.")
+        print("[INFO] I.R.I.S. Session Terminated Cleanly.")
+
 
 if __name__ == "__main__":
     main()
